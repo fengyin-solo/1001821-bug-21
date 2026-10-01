@@ -1,4 +1,4 @@
-"""压力监测接口：维护压力记录，覆盖启动采集、标记越限、停止监测等动作。"""
+"""压力监测接口：维护压力记录，覆盖启动采集、标记越限、停止监测、归属变更等动作。"""
 from __future__ import annotations
 
 from typing import Any
@@ -16,17 +16,93 @@ LIST_FIELDS = ["监测编号", "监测点位", "监测时段", "平均压力", "
 STATUSES = ["待采集", "采集正常", "压力越限", "已停测"]
 
 
+def _list_kwargs(
+    keyword: str | None,
+    point: str | None,
+    period: str | None,
+    period_start: str | None,
+    period_end: str | None,
+    status: str | None,
+) -> dict[str, Any]:
+    return {
+        "keyword": keyword or None,
+        "point": point or None,
+        "period": period or None,
+        "period_start": period_start or None,
+        "period_end": period_end or None,
+        "status": status or None,
+    }
+
+
+# 固定路径放在 /{entry_id} 之前，避免「export / stats / transfer」被当作记录 id 匹配
+@router.get("/export")
+def export_entries(
+    keyword: str | None = None,
+    point: str | None = Query(default=None, description="按监测点位过滤，与列表同一口径"),
+    period: str | None = Query(default=None, description="按监测时段片段过滤"),
+    period_start: str | None = Query(default=None, description="监测时段起（含），YYYY-MM-DD"),
+    period_end: str | None = Query(default=None, description="监测时段止（含），YYYY-MM-DD"),
+    status: str | None = None,
+) -> dict[str, Any]:
+    """导出当前过滤条件下的全量数据；不带条件时才导出全部。"""
+    items, total = service.list_entries(
+        **_list_kwargs(keyword, point, period, period_start, period_end, status),
+        page=1,
+        size=10000,
+    )
+    return {
+        "module": "pressure",
+        "total": total,
+        "filters": {
+            "keyword": keyword or None,
+            "point": point or None,
+            "period": period or None,
+            "period_start": period_start or None,
+            "period_end": period_end or None,
+            "status": status or None,
+        },
+        "items": items,
+    }
+
+
+@router.get("/stats")
+def pressure_stats() -> dict[str, int]:
+    """压力看板统计：点位按去重计数，今日越限次数按时段当天汇总。"""
+    return service.stats()
+
+
+@router.post("/transfer")
+def transfer_ownership(payload: EntryPayload) -> ActionResult:
+    """变更监测点位归属；历史记录保留原归属，只有之后新登记记录跟随新归属。"""
+    point = str(payload.values.get("point") or payload.values.get("监测点位") or "")
+    new_owner = str(payload.values.get("owner") or payload.values.get("归属班组") or "")
+    result, message = service.transfer_ownership(point, new_owner)
+    if result is None:
+        return ActionResult(ok=False, message=message)
+    return ActionResult(ok=True, message=message, entry=result)
+
+
 @router.get("", response_model=PageResult[dict])
 def list_entries(
     keyword: str | None = Query(default=None, description="按监测编号检索"),
+    point: str | None = Query(default=None, description="按监测点位过滤"),
+    period: str | None = Query(default=None, description="按监测时段片段过滤"),
+    period_start: str | None = Query(default=None, description="监测时段起（含），YYYY-MM-DD"),
+    period_end: str | None = Query(default=None, description="监测时段止（含），YYYY-MM-DD"),
     status: str | None = Query(default=None, description="待采集、采集正常、压力越限、已停测"),
     page: int = 1,
     size: int = 20,
 ) -> PageResult[dict]:
-    """按监测编号与状态过滤压力监测列表；没有数据时返回空页，不报错。"""
+    """按监测编号、监测点位、监测时段与状态过滤压力监测列表；没有数据时返回空页，不报错。"""
     if size > 200:
         raise HTTPException(status_code=400, detail="每页最多 200 条，请缩小分页范围")
-    items, total = service.list_entries(keyword=keyword, status=status, page=page, size=size)
+    if page < 1:
+        page = 1
+    items, total = service.list_entries(
+        **_list_kwargs(keyword, point, period, period_start, period_end, status),
+        page=page,
+        size=size,
+    )
     return PageResult(items=items, total=total, page=page, size=size)
 
 
@@ -56,10 +132,3 @@ def run_action(entry_id: int, payload: EntryPayload) -> ActionResult:
     if entry is None:
         return ActionResult(ok=False, message=message)
     return ActionResult(ok=True, message=message, entry=entry)
-
-
-@router.get("/export")
-def export_entries() -> dict[str, Any]:
-    """导出压力监测清单：返回当前过滤条件下的全量数据。"""
-    items, total = service.list_entries(page=1, size=10000)
-    return {"module": "pressure", "total": total, "items": items}
